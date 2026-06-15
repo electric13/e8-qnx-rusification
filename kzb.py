@@ -404,24 +404,82 @@ class KZBProcessor:
             local = addr
             target = escape_path(node)
             is_png = '.png' in node.lower()
+            is_font = '.ttf' in node.lower() or '.otf' in node.lower()
+            is_loc = False
+            
+            data_to_extract = b''
+            
+            if is_png:
+                header = self.G_bin[local:local+24]
+                if len(header) >= 24 and header[0:16] == b'\x00' * 16:
+                    local += 24
+                    data_to_extract = self.G_bin[local:local+size-24]
+                else:
+                    is_png = False
+                    data_to_extract = self.G_bin[local:local+size]
+            elif is_font:
+                header = self.G_bin[local:local+8]
+                if len(header) >= 8 and header[0:4] == b'\x00' * 4:
+                    local += 8
+                    data_to_extract = self.G_bin[local:local+size-8]
+                else:
+                    is_font = False
+                    data_to_extract = self.G_bin[local:local+size]
+            else:
+                data_to_extract = self.G_bin[local:local+size]
             
             target_name = 'r_' + target.name
+            
+            if not is_png and not is_font:
+                d = data_to_extract
+                parsed_loc = None
+                if len(d) >= 20 and d[:16] == b'\x00'*16:
+                    count = int.from_bytes(d[16:20], 'little')
+                    s_idx = 20
+                    strings = []
+                    valid = True
+                    while s_idx < len(d):
+                        end = d.find(b'\x00', s_idx)
+                        if end == -1:
+                            valid = False; break
+                        try:
+                            s = d[s_idx:end].decode('utf-8')
+                        except UnicodeDecodeError:
+                            valid = False; break
+                        strings.append(s)
+                        s_idx = end + 1
+                    
+                    if valid and ((count > 0 and len(strings) == count * 2) or (count == 0 and len(strings) == 0)):
+                        res = {}
+                        for j in range(count):
+                            res[strings[j*2]] = strings[j*2+1]
+                        parsed_loc = res
+                
+                if parsed_loc is not None:
+                    is_loc = True
+                    target_name += '.json'
+                    data_to_extract = json.dumps(parsed_loc, indent=4, ensure_ascii=False).encode('utf-8')
+
             meta_nodes.append({
                 "orig": raw_nodes[i],
                 "target": target_name,
                 "idx": idx,
                 "unk1": unk1,
                 "unk4": unk4,
-                "is_png": is_png
+                "is_png": is_png,
+                "is_font": is_font,
+                "is_loc": is_loc
             })
             
-            if is_png:
-                local += 6 * 4
-                if self.G_extract:
-                    self.extract_resource_kzbf(target, local, size - (6 * 4))
-            else:
-                if self.G_extract:
-                    self.extract_resource_kzbf(target, local, size)
+            if self.G_extract:
+                safe_rel = fit_path_under(self.G_extract_path, target, 240)
+                out_path = (self.G_extract_path / safe_rel)
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path = out_path.with_name(target_name)
+                buffer_to_file(out_path, data_to_extract)
+                self.processed_files += 1
+                if self.total_files > 0:
+                    self.update_progress(self.processed_files, self.total_files, f"Extracting: {target.name}")
 
         if self.G_extract:
             meta = {
@@ -570,6 +628,9 @@ def pack_kzbf(extracted_dir: Path, output_file: Path, log_callback, progress_cal
         out.extend(node['orig'].encode('utf-8'))
         out.append(0)
         
+    while len(out) % 4 != 0:
+        out.append(0)
+        
     out.extend(struct.pack('<I', len(meta['nodes'])))
     
     elem_ph_pos = len(out)
@@ -592,12 +653,36 @@ def pack_kzbf(extracted_dir: Path, output_file: Path, log_callback, progress_cal
             log_callback(f"[WARNING] File not found, packing empty: {disk_path}")
             data = b''
         else:
-            with open(disk_path, 'rb') as f:
-                data = f.read()
+            if node.get('is_loc'):
+                try:
+                    with open(disk_path, 'r', encoding='utf-8') as f:
+                        loc_dict = json.load(f)
+                    out_loc = bytearray(b'\x00' * 16)
+                    out_loc.extend(struct.pack('<I', len(loc_dict)))
+                    for k, v in loc_dict.items():
+                        out_loc.extend(k.encode('utf-8'))
+                        out_loc.append(0)
+                        out_loc.extend(v.encode('utf-8'))
+                        out_loc.append(0)
+                    data = bytes(out_loc)
+                except Exception as e:
+                    log_callback(f"[ERROR] Failed to compile localization JSON {disk_path}: {e}")
+                    if output_file.exists():
+                        output_file.unlink()
+                    raise RuntimeError(f"Failed to process localization file {disk_path.name}: {e}")
+            else:
+                with open(disk_path, 'rb') as f:
+                    data = f.read()
                 
         if node['is_png']:
             png_header = struct.pack('<6I', 0, 0, 0, 0, 1, len(data))
             data = png_header + data
+        elif node.get('is_font'):
+            font_header = struct.pack('<II', 0, len(data))
+            data = font_header + data
+            
+        while len(out) % 4 != 0:
+            out.append(0)
             
         addr = len(out)
         size = len(data)
