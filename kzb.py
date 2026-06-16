@@ -433,27 +433,33 @@ class KZBProcessor:
             if not is_png and not is_font:
                 d = data_to_extract
                 parsed_loc = None
-                if len(d) >= 20 and d[:16] == b'\x00'*16:
-                    count = int.from_bytes(d[16:20], 'little')
-                    s_idx = 20
-                    strings = []
-                    valid = True
-                    while s_idx < len(d):
-                        end = d.find(b'\x00', s_idx)
-                        if end == -1:
-                            valid = False; break
-                        try:
-                            s = d[s_idx:end].decode('utf-8')
-                        except UnicodeDecodeError:
-                            valid = False; break
-                        strings.append(s)
-                        s_idx = end + 1
-                    
-                    if valid and ((count > 0 and len(strings) == count * 2) or (count == 0 and len(strings) == 0)):
-                        res = {}
-                        for j in range(count):
-                            res[strings[j*2]] = strings[j*2+1]
-                        parsed_loc = res
+                parsed_meta = []
+                if len(d) >= 16 and d[:12] == b'\x00'*12:
+                    meta_n = int.from_bytes(d[12:16], 'little')
+                    header_size = 16 + meta_n * 4
+                    if len(d) >= header_size + 4:
+                        for j in range(meta_n):
+                            parsed_meta.append(int.from_bytes(d[16 + j*4 : 20 + j*4], 'little'))
+                        count = int.from_bytes(d[header_size:header_size+4], 'little')
+                        s_idx = header_size + 4
+                        strings = []
+                        valid = True
+                        while s_idx < len(d):
+                            end = d.find(b'\x00', s_idx)
+                            if end == -1:
+                                valid = False; break
+                            try:
+                                s = d[s_idx:end].decode('utf-8')
+                            except UnicodeDecodeError:
+                                valid = False; break
+                            strings.append(s)
+                            s_idx = end + 1
+                        
+                        if valid and ((count > 0 and len(strings) == count * 2) or (count == 0 and len(strings) == 0)):
+                            res = {"__meta__": parsed_meta, "strings": {}}
+                            for j in range(count):
+                                res["strings"][strings[j*2]] = strings[j*2+1]
+                            parsed_loc = res
                 
                 if parsed_loc is not None:
                     is_loc = True
@@ -657,9 +663,21 @@ def pack_kzbf(extracted_dir: Path, output_file: Path, log_callback, progress_cal
                 try:
                     with open(disk_path, 'r', encoding='utf-8') as f:
                         loc_dict = json.load(f)
-                    out_loc = bytearray(b'\x00' * 16)
-                    out_loc.extend(struct.pack('<I', len(loc_dict)))
-                    for k, v in loc_dict.items():
+                    out_loc = bytearray(b'\x00' * 12)
+                    
+                    if '__meta__' in loc_dict and 'strings' in loc_dict:
+                        meta_ints = loc_dict['__meta__']
+                        strings_dict = loc_dict['strings']
+                    else:
+                        meta_ints = [0]
+                        strings_dict = loc_dict
+                        
+                    out_loc.extend(struct.pack('<I', len(meta_ints)))
+                    for m_val in meta_ints:
+                        out_loc.extend(struct.pack('<I', m_val))
+                        
+                    out_loc.extend(struct.pack('<I', len(strings_dict)))
+                    for k, v in strings_dict.items():
                         out_loc.extend(k.encode('utf-8'))
                         out_loc.append(0)
                         out_loc.extend(v.encode('utf-8'))
